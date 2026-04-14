@@ -1,0 +1,48 @@
+# Environment and secrets
+.env
+.env.local
+.env.*
+*.env
+secrets/
+*_secret*
+*_key.json
+credentials.json
+service_account*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+.venv/
+venv/
+env/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# Databricks
+.databricks/
+
+# Data files (large — use GitHub Releases for artifacts)
+*.csv
+*.parquet
+*.zip
+!tests/fixtures/*.csv
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store

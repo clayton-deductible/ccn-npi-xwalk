@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ccn-npi-xwalk"
+version = "1.0.0"
+description = "CCN to NPI crosswalk — open-source matching algorithm for CMS hospital facilities"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "DeductibleData Co.", email = "clayton@deductibledata.com" }
+]
+keywords = ["healthcare", "cms", "npi", "ccn", "crosswalk", "hospital", "transparency"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Healthcare Industry",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "requests>=2.28.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/clayton-deductible/ccn-npi-xwalk"
+Repository = "https://github.com/clayton-deductible/ccn-npi-xwalk"
+Issues = "https://github.com/clayton-deductible/ccn-npi-xwalk/issues"
+
+[project.scripts]
+ccn-npi-xwalk = "ccn_npi_xwalk.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ccn_npi_xwalk"]
