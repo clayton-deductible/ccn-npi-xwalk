@@ -19,9 +19,22 @@ This project builds the crosswalk from first principles using two public CMS dat
 
 ---
 
+## Cardinality
+
+- **CCN is the parent**: one CCN can map to multiple NPIs. Each row in the output represents one CCN:NPI pair.
+- **NPI is distinct**: each NPI appears at most once in the output, assigned to the highest-confidence strategy that matched it.
+- **Unmatched rows**: CCNs with zero NPIs found appear once with `npi` blank.
+
 ## Algorithm
 
-Matching proceeds through four strategies in order. Once a CCN is matched, it exits the cascade and is not reconsidered by lower strategies.
+Matching proceeds through five strategies. Strategy 0 is authoritative and requires no name matching. Strategies 1–4 cascade — each runs only against CCNs not covered by Strategy 0. Once a CCN enters the cascade and matches, it exits; lower strategies only see CCNs still unmatched.
+
+### Strategy 0: CMS Hospital Enrollments (Authoritative)
+Direct CCN:NPI pairs from CMS Medicare enrollment records. Covers acute care hospitals, Critical Access Hospitals (CAH), and Rural Emergency Hospitals (REH) that participate in Medicare. No name matching — these pairs are taken as ground truth.
+
+**Source**: CMS Hospital Enrollments file (data.cms.gov)
+**Coverage**: ~9,300 Medicare-enrolled hospitals
+**Confidence**: Authoritative.
 
 ### Strategy 1: Exact Name + State + City
 Both names are normalized identically (see below), then matched on the combination of normalized name, 2-character state code, and city name.

@@ -2,27 +2,25 @@
 # MAGIC %md
 # MAGIC # Notebook 3 — Match CCN to NPI
 # MAGIC
-# MAGIC **What this does**:
-# MAGIC Joins the CMS POS hospital records (keyed by CCN) to NPPES organization records
-# MAGIC (keyed by NPI) using a 4-strategy cascade matching algorithm.
-# MAGIC
 # MAGIC **Prerequisites**: Run `01_ingest_cms_pos.py` and `02_ingest_nppes.py` first.
 # MAGIC
 # MAGIC ## Matching Strategy (in priority order)
 # MAGIC
-# MAGIC | Strategy | Method | Confidence |
-# MAGIC |----------|--------|------------|
-# MAGIC | 1 | Normalized name + state + city (exact) | High |
-# MAGIC | 2 | Normalized name + state only | Medium-High |
-# MAGIC | 3 | 3-word name prefix + state + city | Medium |
-# MAGIC | 4 | Zip code + hospital taxonomy (28xxx) + Levenshtein ≤ 7 | Medium-Low |
-# MAGIC | — | Unmatched (no NPI found) | — |
+# MAGIC | Strategy | Method | Source | Confidence |
+# MAGIC |----------|--------|--------|------------|
+# MAGIC | 0 | Direct enrollment lookup | CMS Hospital Enrollments | Authoritative |
+# MAGIC | 1 | Normalized name + state + city | NPPES | High |
+# MAGIC | 2 | Normalized name + state only | NPPES | Medium-High |
+# MAGIC | 3 | 3-word name prefix + state + city | NPPES | Medium |
+# MAGIC | 4 | Zip + hospital taxonomy (28xxx) + Levenshtein ≤ 7 | NPPES | Medium-Low |
+# MAGIC | — | Unmatched | — | — |
 # MAGIC
-# MAGIC **Name normalization** expands common hospital abbreviations before matching:
-# MAGIC HOSP → HOSPITAL, MED CTR → MEDICAL CENTER, CTR → CENTER, etc.
-# MAGIC This is applied identically to both POS and NPPES names.
+# MAGIC ## Cardinality rules
 # MAGIC
-# MAGIC **Output**: `{catalog}.{schema}.ccn_npi_crosswalk` Delta table + optional CSV export
+# MAGIC - **CCN is the parent**: one CCN can map to multiple NPIs (one row per NPI)
+# MAGIC - **NPI is distinct**: each NPI appears at most once in the output, assigned
+# MAGIC   to the highest-confidence strategy that matched it
+# MAGIC - Strategies 1–4 only run against CCNs with no match from Strategy 0
 
 # COMMAND ----------
 
@@ -39,8 +37,8 @@ CATALOG = dbutils.widgets.get("catalog")
 SCHEMA = dbutils.widgets.get("schema")
 EXPORT_CSV_PATH = dbutils.widgets.get("export_csv_path").strip()
 
-print(f"Source: {CATALOG}.{SCHEMA}.cms_pos + {CATALOG}.{SCHEMA}.nppes_orgs")
-print(f"Output: {CATALOG}.{SCHEMA}.ccn_npi_crosswalk")
+print(f"Source tables: {CATALOG}.{SCHEMA}.cms_pos + nppes_orgs + hospital_enrollments")
+print(f"Output table:  {CATALOG}.{SCHEMA}.ccn_npi_crosswalk")
 
 # COMMAND ----------
 
@@ -49,23 +47,26 @@ print(f"Output: {CATALOG}.{SCHEMA}.ccn_npi_crosswalk")
 
 # COMMAND ----------
 
-from pyspark.sql.functions import col, trim, upper, regexp_replace, when, lit
+from pyspark.sql.functions import col, trim, upper, regexp_replace, when, lit, row_number
 from pyspark.sql.types import LongType
+from pyspark.sql.window import Window
 
-hospitals = spark.table(f"{CATALOG}.{SCHEMA}.cms_pos")
-nppes_raw = spark.table(f"{CATALOG}.{SCHEMA}.nppes_orgs")
+hospitals   = spark.table(f"{CATALOG}.{SCHEMA}.cms_pos")
+nppes_raw   = spark.table(f"{CATALOG}.{SCHEMA}.nppes_orgs")
+enrollments = spark.table(f"{CATALOG}.{SCHEMA}.hospital_enrollments")
 
-print(f"POS hospitals:  {hospitals.count():,}")
-print(f"NPPES org rows: {nppes_raw.count():,}")
+print(f"POS hospitals:       {hospitals.count():,}")
+print(f"NPPES org rows:      {nppes_raw.count():,}")
+print(f"Enrollment records:  {enrollments.count():,}")
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Name Normalization
 # MAGIC
-# MAGIC Applied to both POS facility names and NPPES organization names before matching.
-# MAGIC Abbreviation list is intentionally conservative — single-letter and ambiguous
-# MAGIC patterns (N/S/E/W, CO, ST) are excluded to avoid false positives.
+# MAGIC Applied identically to POS and NPPES names before any comparison.
+# MAGIC Abbreviation list is conservative — single-letter and ambiguous patterns
+# MAGIC excluded to avoid false positives.
 
 # COMMAND ----------
 
@@ -90,21 +91,59 @@ ABBREVIATION_MAP = [
 ]
 
 def normalize_name(name_col):
-    """Normalize a hospital name column for matching."""
     result = upper(trim(regexp_replace(name_col, r"\s+", " ")))
-    # Strip legal suffixes that differ between POS and NPPES registrations
     result = regexp_replace(result, r",?\s*(INC\.?|LLC|LP|LLP|CORP\.?|LTD\.?)$", "")
-    # Expand abbreviations
     for pattern, replacement in ABBREVIATION_MAP:
         result = regexp_replace(result, pattern, replacement)
-    # Re-collapse double spaces introduced by expansions
     result = trim(regexp_replace(result, r"\s+", " "))
     return result
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Prepare NPPES for Matching
+# MAGIC ## Strategy 0 — CMS Hospital Enrollments (Authoritative)
+# MAGIC
+# MAGIC Direct CCN:NPI pairs from Medicare enrollment records.
+# MAGIC No name matching required — these are taken as ground truth.
+
+# COMMAND ----------
+
+# Each enrollment row is already a (CCN, NPI) pair.
+# Keep the facility metadata from POS by joining on CCN.
+match_enrollments = enrollments.join(
+    hospitals, "ccn", "inner"
+).select(
+    col("npi"),
+    col("ccn"),
+    col("facility_name"),
+    col("city"),
+    col("state"),
+    col("zip_code"),
+    col("total_bed_count"),
+    col("certified_bed_count"),
+    col("facility_type_code"),
+    col("facility_type"),
+    col("ownership_type_code"),
+    col("ownership_type"),
+    col("psych_unit_beds"),
+    col("rehab_unit_beds"),
+    col("bed_size_band"),
+    lit("hospital_enrollments").alias("match_method"),
+)
+
+enrolled_ccns = match_enrollments.select("ccn").distinct()
+enrolled_npis = match_enrollments.select("npi").distinct()
+
+print(f"Strategy 0 (enrollments): {match_enrollments.count():,} CCN:NPI pairs "
+      f"across {enrolled_ccns.count():,} CCNs")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Prepare NPPES for Name Matching
+# MAGIC
+# MAGIC Strategies 1–4 only run against CCNs not covered by Strategy 0.
+# MAGIC NPPES is also filtered to exclude NPIs already claimed by Strategy 0.
 
 # COMMAND ----------
 
@@ -115,9 +154,12 @@ nppes = nppes_raw.select(
     upper(trim(col("npi_city"))).alias("nppes_city"),
     col("npi_postal_code").substr(1, 5).alias("nppes_zip"),
     col("taxonomy_code_1"),
-)
+).join(enrolled_npis, "npi", "left_anti")  # exclude already-claimed NPIs
 
-hospitals_norm = hospitals.withColumn(
+# Hospitals not covered by Strategy 0
+unmatched_0 = hospitals.join(enrolled_ccns, "ccn", "left_anti")
+
+hospitals_norm = unmatched_0.withColumn(
     "pos_name_norm", normalize_name(col("facility_name"))
 ).withColumn(
     "pos_state_norm", upper(trim(col("state")))
@@ -125,10 +167,13 @@ hospitals_norm = hospitals.withColumn(
     "pos_city_norm", upper(trim(col("city")))
 )
 
+print(f"CCNs entering NPPES matching: {hospitals_norm.count():,}")
+print(f"NPPES orgs available:         {nppes.count():,}")
+
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Strategy 1: Exact Match — Normalized Name + State + City
+# MAGIC ## Strategy 1 — Exact Name + State + City
 
 # COMMAND ----------
 
@@ -141,14 +186,12 @@ match_exact = hospitals_norm.join(
 ).withColumn("match_method", lit("exact_name_state_city"))
 
 matched_ccns_exact = match_exact.select("ccn").distinct()
-print(f"Strategy 1 (exact): {matched_ccns_exact.count():,} CCNs matched")
+print(f"Strategy 1 (exact):  {match_exact.count():,} pairs across {matched_ccns_exact.count():,} CCNs")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Strategy 2: Normalized Name + State Only
-# MAGIC
-# MAGIC Catches city name variations (e.g., "Saint Louis" vs "St. Louis").
+# MAGIC ## Strategy 2 — Normalized Name + State Only
 
 # COMMAND ----------
 
@@ -162,16 +205,12 @@ match_state = unmatched_1.join(
 ).withColumn("match_method", lit("name_state"))
 
 matched_ccns_state = match_state.select("ccn").distinct()
-print(f"Strategy 2 (name+state): {matched_ccns_state.count():,} CCNs matched")
+print(f"Strategy 2 (name+state): {match_state.count():,} pairs across {matched_ccns_state.count():,} CCNs")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Strategy 3: 3-Word Name Prefix + State + City
-# MAGIC
-# MAGIC Catches name suffix variations, e.g.:
-# MAGIC   POS:   "NORTON HOSPITAL PAVILION A"
-# MAGIC   NPPES: "NORTON HOSPITAL"
+# MAGIC ## Strategy 3 — 3-Word Name Prefix + State + City
 
 # COMMAND ----------
 
@@ -205,28 +244,19 @@ match_prefix = unmatched_2.filter(col("pos_prefix").isNotNull()).join(
 ).withColumn("match_method", lit("prefix_name_state_city"))
 
 matched_ccns_prefix = match_prefix.select("ccn").distinct()
-print(f"Strategy 3 (prefix): {matched_ccns_prefix.count():,} CCNs matched")
+print(f"Strategy 3 (prefix): {match_prefix.count():,} pairs across {matched_ccns_prefix.count():,} CCNs")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Strategy 4: Zip Code + Hospital Taxonomy + Levenshtein Distance
+# MAGIC ## Strategy 4 — Zip + Hospital Taxonomy + Levenshtein Distance
 # MAGIC
-# MAGIC For hospitals where names differ significantly between POS and NPPES
-# MAGIC (e.g., rebrands, DBA names). Matches on:
-# MAGIC   - Same 5-digit zip code
-# MAGIC   - Same state
-# MAGIC   - NPPES taxonomy code starts with "28" (hospital taxonomy codes)
-# MAGIC   - Levenshtein edit distance between normalized names ≤ 7
-# MAGIC
-# MAGIC When multiple NPPES candidates match a CCN, the closest name wins.
-# MAGIC Threshold of 7 was chosen empirically — tight enough to avoid false matches
-# MAGIC at the zip level, loose enough to catch common rebrand patterns.
+# MAGIC Threshold of ≤ 7 edit distance was calibrated empirically against known
+# MAGIC hospital rebrands. See docs/methodology.md for details.
 
 # COMMAND ----------
 
-from pyspark.sql.functions import levenshtein, row_number
-from pyspark.sql.window import Window
+from pyspark.sql.functions import levenshtein
 
 unmatched_3 = unmatched_2.join(matched_ccns_prefix, "ccn", "left_anti").drop(
     "pos_name_words", "pos_prefix"
@@ -250,26 +280,21 @@ match_zip_tax = unmatched_3.join(
     "lev_dist", levenshtein(col("pos_name_norm"), col("nppes_name_norm"))
 ).filter(
     col("lev_dist") <= 7
-)
-
-w_lev = Window.partitionBy("ccn").orderBy(col("lev_dist"))
-match_zip_tax = match_zip_tax.withColumn("_rn", row_number().over(w_lev)).filter(
-    col("_rn") == 1
-).drop("_rn", "lev_dist", "nppes_zip"
+).drop("lev_dist", "nppes_zip"
 ).withColumn("match_method", lit("zip_taxonomy_levenshtein"))
 
 matched_ccns_zip = match_zip_tax.select("ccn").distinct()
-print(f"Strategy 4 (zip+taxonomy+levenshtein): {matched_ccns_zip.count():,} CCNs matched")
+print(f"Strategy 4 (zip+tax+lev): {match_zip_tax.count():,} pairs across {matched_ccns_zip.count():,} CCNs")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Collect Unmatched
+# MAGIC ## Unmatched CCNs
 
 # COMMAND ----------
 
 unmatched_final = unmatched_3.join(matched_ccns_zip, "ccn", "left_anti").withColumn(
-    "npi", lit(None).cast("long")
+    "npi", lit(None).cast(LongType())
 ).withColumn(
     "match_method", lit("unmatched")
 )
@@ -278,7 +303,7 @@ print(f"Unmatched: {unmatched_final.count():,} CCNs")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Combine, Deduplicate, and Write
+# MAGIC ## Combine All Strategies
 
 # COMMAND ----------
 
@@ -295,39 +320,76 @@ drop_cols = ["pos_name_norm", "pos_state_norm", "pos_city_norm",
              "nppes_name_norm", "nppes_state", "nppes_city",
              "nppes_zip", "taxonomy_code_1"]
 
+def clean_select(df):
+    return df.drop(*[c for c in drop_cols if c in df.columns]).select(*final_columns)
+
 combined = (
-    match_exact.drop(*[c for c in drop_cols if c in match_exact.columns]).select(*final_columns)
-    .unionByName(match_state.drop(*[c for c in drop_cols if c in match_state.columns]).select(*final_columns))
-    .unionByName(match_prefix.drop(*[c for c in drop_cols if c in match_prefix.columns]).select(*final_columns))
-    .unionByName(match_zip_tax.drop(*[c for c in drop_cols if c in match_zip_tax.columns]).select(*final_columns))
-    .unionByName(unmatched_final.drop(*[c for c in drop_cols if c in unmatched_final.columns]).select(*final_columns))
+    clean_select(match_enrollments)
+    .unionByName(clean_select(match_exact))
+    .unionByName(clean_select(match_state))
+    .unionByName(clean_select(match_prefix))
+    .unionByName(clean_select(match_zip_tax))
+    .unionByName(clean_select(unmatched_final))
 )
 
-# Deduplicate: if a CCN matched via multiple strategies, keep highest confidence
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Deduplicate on NPI
+# MAGIC
+# MAGIC **Cardinality rules:**
+# MAGIC - CCN can appear multiple times (one row per matched NPI)
+# MAGIC - NPI must be globally distinct — if an NPI matched via multiple strategies,
+# MAGIC   keep only the highest-confidence match
+# MAGIC - Unmatched rows (npi = null) are always kept, one per CCN
+
+# COMMAND ----------
+
 match_priority = (
-    when(col("match_method") == "exact_name_state_city", 1)
-    .when(col("match_method") == "name_state", 2)
-    .when(col("match_method") == "prefix_name_state_city", 3)
-    .when(col("match_method") == "zip_taxonomy_levenshtein", 4)
-    .otherwise(5)
+    when(col("match_method") == "hospital_enrollments",     1)
+    .when(col("match_method") == "exact_name_state_city",   2)
+    .when(col("match_method") == "name_state",              3)
+    .when(col("match_method") == "prefix_name_state_city",  4)
+    .when(col("match_method") == "zip_taxonomy_levenshtein",5)
+    .otherwise(6)  # unmatched
 )
 
-w = Window.partitionBy("ccn").orderBy(match_priority)
-deduped = combined.withColumn("_rn", row_number().over(w)).filter(col("_rn") == 1).drop("_rn")
+# For matched rows: deduplicate on NPI, keeping highest-confidence strategy
+matched_rows = combined.filter(col("npi").isNotNull())
+w_npi = Window.partitionBy("npi").orderBy(match_priority)
+deduped_matched = (
+    matched_rows
+    .withColumn("_rn", row_number().over(w_npi))
+    .filter(col("_rn") == 1)
+    .drop("_rn")
+)
 
-# Cast NPI to bigint
-deduped = deduped.withColumn("npi", col("npi").cast(LongType()))
+# For unmatched rows: one row per CCN (CCNs with zero NPIs found)
+matched_ccns_all = deduped_matched.select("ccn").distinct()
+unmatched_rows = combined.filter(col("npi").isNull()).join(
+    matched_ccns_all, "ccn", "left_anti"
+)
 
-# Write
-deduped.write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.ccn_npi_crosswalk")
+output = deduped_matched.unionByName(unmatched_rows)
 
-# Summary
-total = spark.table(f"{CATALOG}.{SCHEMA}.ccn_npi_crosswalk").count()
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Write Output Table
+
+# COMMAND ----------
+
+output.write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.ccn_npi_crosswalk")
+
+total   = spark.table(f"{CATALOG}.{SCHEMA}.ccn_npi_crosswalk").count()
 matched = spark.table(f"{CATALOG}.{SCHEMA}.ccn_npi_crosswalk").filter(col("npi").isNotNull()).count()
+unique_ccns = spark.table(f"{CATALOG}.{SCHEMA}.ccn_npi_crosswalk").select("ccn").distinct().count()
+
 print(f"\nOutput: {CATALOG}.{SCHEMA}.ccn_npi_crosswalk")
-print(f"  Total CCNs:   {total:,}")
-print(f"  NPI matched:  {matched:,} ({matched * 100 // total}%)")
-print(f"  Unmatched:    {total - matched:,} ({(total - matched) * 100 // total}%)")
+print(f"  Total rows:      {total:,}")
+print(f"  Matched rows:    {matched:,}")
+print(f"  Unmatched CCNs:  {total - matched:,}")
+print(f"  Unique CCNs:     {unique_ccns:,}")
 print()
 spark.table(f"{CATALOG}.{SCHEMA}.ccn_npi_crosswalk").groupBy("match_method").count().orderBy("count", ascending=False).show()
 
@@ -346,10 +408,59 @@ if EXPORT_CSV_PATH:
         .option("header", "true")
         .csv(f"dbfs:{EXPORT_CSV_PATH}_parts")
     )
-    # Rename the single part file to the desired path
-    import subprocess
     parts = dbutils.fs.ls(f"{EXPORT_CSV_PATH}_parts")
     csv_part = [p.path for p in parts if p.name.startswith("part-")][0]
     dbutils.fs.cp(csv_part, EXPORT_CSV_PATH)
     dbutils.fs.rm(f"{EXPORT_CSV_PATH}_parts", recurse=True)
     print(f"CSV exported to dbfs:{EXPORT_CSV_PATH}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Validation Against Reference Set
+# MAGIC
+# MAGIC Measures precision and recall against a known-good CCN:NPI reference file.
+# MAGIC Set `validation_csv_path` to run this section. The reference file must have
+# MAGIC columns `CCN` and `NPI`.
+
+# COMMAND ----------
+
+dbutils.widgets.text("validation_csv_path", "", "Validation CSV path (DBFS, optional)")
+VALIDATION_PATH = dbutils.widgets.get("validation_csv_path").strip()
+
+if VALIDATION_PATH:
+    ref = spark.read.csv(f"dbfs:{VALIDATION_PATH}", header=True, inferSchema=False).select(
+        trim(col("CCN")).alias("ccn"),
+        trim(col("NPI")).alias("npi_str"),
+    ).filter(
+        col("ccn").isNotNull() & (col("ccn") != "") &
+        col("npi_str").isNotNull() & (col("npi_str") != "") &
+        (col("ccn") != "N/A")
+    ).withColumn("npi", col("npi_str").cast(LongType())).drop("npi_str")
+
+    our = spark.table(f"{CATALOG}.{SCHEMA}.ccn_npi_crosswalk").filter(col("npi").isNotNull()).select("ccn", "npi")
+
+    ref_count  = ref.count()
+    our_count  = our.count()
+    tp         = our.join(ref, ["ccn", "npi"], "inner").count()
+    precision  = tp / our_count * 100 if our_count else 0
+    recall     = tp / ref_count  * 100 if ref_count  else 0
+
+    print(f"Validation results:")
+    print(f"  Reference pairs:  {ref_count:,}")
+    print(f"  Our pairs:        {our_count:,}")
+    print(f"  True positives:   {tp:,}")
+    print(f"  Precision:        {precision:.1f}%  (our matches that are in reference)")
+    print(f"  Recall:           {recall:.1f}%  (reference pairs we found)")
+    print()
+
+    # Breakdown by strategy
+    print("Precision by strategy:")
+    our_with_method = spark.table(f"{CATALOG}.{SCHEMA}.ccn_npi_crosswalk").filter(col("npi").isNotNull())
+    breakdown = our_with_method.join(ref.withColumn("in_ref", lit(True)), ["ccn", "npi"], "left").fillna(False, ["in_ref"])
+    breakdown.groupBy("match_method").agg(
+        {"npi": "count", "in_ref": "sum"}
+    ).withColumnRenamed("count(npi)", "our_count").withColumnRenamed("sum(in_ref)", "in_ref_count").orderBy("our_count", ascending=False).show()
+else:
+    print("No validation_csv_path set — skipping validation.")
+    print("To validate, upload your reference CSV to DBFS and set the widget.")
