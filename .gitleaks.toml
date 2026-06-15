@@ -1,0 +1,14 @@
+title = "DeductibleData gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Non-secret values intentionally present in this org's repos: this AWS account's access key IDs (the public half — secret keys are NOT allowlisted), the Paperclip 'local-board' auth string (auth theater; any bearer value returns 200 on localhost), and scrub markers left by the 2026-06-15 history rewrite."
+regexes = [
+  '''AKIA22SGM2V6[A-Z0-9]{8}''',
+  '''local-board''',
+  '''SCRUBBED''',
+  '''sk_test_''',
+  '''pk_test_''',
+]
